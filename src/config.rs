@@ -1,12 +1,9 @@
-use std::cell::RefCell;
 use std::path::{Path, PathBuf};
-use std::rc::Rc;
 
 use anyhow::{Context, Result};
-use rquickjs::{function::Func, Context as JsContext, Runtime as JsRuntime};
 use serde::Deserialize;
 
-use crate::executor::ModuleResolver;
+use crate::executor::{self, ModuleResolver};
 
 pub const TS_CONFIG_FILE: &str = "gaji.config.ts";
 pub const TS_LOCAL_CONFIG_FILE: &str = "gaji.config.local.ts";
@@ -206,41 +203,6 @@ impl From<TsGajiConfig> for Config {
     }
 }
 
-/// Execute JavaScript in QuickJS and capture config JSON via `__gha_set_config`.
-fn execute_config_js(code: &str) -> Result<String> {
-    let result: Rc<RefCell<Option<String>>> = Rc::new(RefCell::new(None));
-
-    {
-        let rt = JsRuntime::new().context("Failed to create QuickJS runtime")?;
-        let ctx = JsContext::full(&rt).context("Failed to create QuickJS context")?;
-
-        let code_owned = code.to_string();
-
-        ctx.with(|ctx| {
-            let result_clone = result.clone();
-
-            let set_config_fn = Func::from(move |json: String| {
-                *result_clone.borrow_mut() = Some(json);
-            });
-
-            ctx.globals()
-                .set("__gha_set_config", set_config_fn)
-                .map_err(|e| anyhow::anyhow!("Failed to set __gha_set_config: {}", e))?;
-
-            ctx.eval::<(), _>(code_owned.as_bytes())
-                .map_err(|e| anyhow::anyhow!("QuickJS config evaluation error: {}", e))?;
-
-            Ok::<_, anyhow::Error>(())
-        })?;
-    }
-
-    let json = Rc::try_unwrap(result)
-        .map_err(|_| anyhow::anyhow!("Failed to unwrap Rc"))?
-        .into_inner()
-        .context("Config script did not call __gha_set_config")?;
-
-    Ok(json)
-}
 
 impl Config {
     /// Load config using a shared `ModuleResolver`.
@@ -267,23 +229,13 @@ impl Config {
 
     /// Load a single TS config file via the resolver.
     /// Unresolvable imports (e.g. `generated/index.js` on a fresh project) are
-    /// skipped — `defineConfig` and other runtime bindings are injected synthetically.
+    /// skipped — `defineConfig` is injected as an identity function synthetically.
     fn load_from_ts_impl(path: &Path, resolver: &mut ModuleResolver) -> Result<Self> {
         if !path.exists() {
             return Ok(Config::default());
         }
-        resolver.load_lenient(path)?;
-        let script = resolver
-            .get_preprocessed_script(path)
-            .unwrap_or_default()
-            .trim()
-            .trim_end_matches(';')
-            .to_string();
-        let wrapped = format!(
-            "function defineConfig(c) {{ return c; }}\nvar __config_result = {};\n__gha_set_config(JSON.stringify(__config_result));",
-            script
-        );
-        let json = execute_config_js(&wrapped)?;
+        let json = executor::execute_config(resolver, path)
+            .with_context(|| format!("Failed to execute config: {}", path.display()))?;
         let ts_config: TsGajiConfig = serde_json::from_str(&json)
             .with_context(|| format!("Failed to parse config JSON from {}", path.display()))?;
         Ok(Config::from(ts_config))

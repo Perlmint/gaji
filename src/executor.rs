@@ -1,7 +1,8 @@
 use std::cell::RefCell;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
+use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result};
 use oxc_allocator::Allocator;
@@ -10,9 +11,9 @@ use oxc_parser::Parser;
 use oxc_semantic::SemanticBuilder;
 use oxc_span::SourceType;
 use oxc_transformer::{TransformOptions, Transformer};
-use rquickjs::{function::Func, Context as JsContext, Runtime as JsRuntime};
+use rquickjs::loader::{Loader, Resolver};
+use rquickjs::{function::Func, Context as JsContext, Module, Runtime as JsRuntime};
 
-/// Output from a single __gha_build call
 #[derive(Debug, Clone)]
 pub struct BuildOutput {
     pub id: String,
@@ -21,8 +22,6 @@ pub struct BuildOutput {
     pub output_type: String,
 }
 
-/// Strip TypeScript types from source code, producing plain JavaScript.
-/// Uses the oxc pipeline: Parser -> SemanticBuilder -> Transformer -> Codegen
 pub fn strip_typescript(source: &str, filename: &str) -> Result<String> {
     let allocator = Allocator::default();
     let source_type =
@@ -47,404 +46,115 @@ pub fn strip_typescript(source: &str, filename: &str) -> Result<String> {
     Ok(code)
 }
 
-struct LoadedModule {
-    script: String,
-    deps: Vec<PathBuf>,
-}
-
-/// Resolves and preprocesses JS/TS modules for QuickJS evaluation.
-///
-/// Each module is stored with exports converted to `var` declarations so they
-/// persist as globals across separate `eval()` calls. Import lines are stripped
-/// (dependencies are tracked and eval'd first instead).
-///
-/// When a module or any of its dependencies cannot be loaded or preprocessed,
-/// it is marked QuickJS N/A (`None`). Callers can detect this via the `bool`
-/// return of `load()` and bail out to a fallback executor.
-#[derive(Default)]
+/// The source cache is shared across multiple `execute_workflow` and
+/// `execute_config` calls, so TypeScript stripping of a common module (e.g.
+/// `lib/common.ts`) is performed only once per process run.
+#[derive(Clone, Default)]
 pub struct ModuleResolver {
-    modules: HashMap<PathBuf, Result<LoadedModule, String>>,
+    cache: Arc<Mutex<HashMap<PathBuf, String>>>,
 }
 
-impl ModuleResolver {
-    /// Load a module and its transitive dependencies.
-    ///
-    /// Returns `Ok(true)` if the module is ready for QuickJS evaluation.
-    /// Returns `Ok(false)` if the module (or any dependency) is QuickJS N/A —
-    /// i.e., a dependency file doesn't exist on disk, or preprocessing failed.
-    pub fn load(&mut self, script_path: &Path) -> Result<bool> {
-        let canonicalized_path = script_path
-            .canonicalize()
-            .context("Failed to canonicalize script path")?;
-
-        match self.modules.get(&canonicalized_path) {
-            Some(Err(_)) => return Ok(false),
-            Some(Ok(_)) => return Ok(true),
-            None => {}
+impl Resolver for ModuleResolver {
+    fn resolve<'js>(
+        &mut self,
+        _ctx: &rquickjs::Ctx<'js>,
+        base: &str,
+        name: &str,
+    ) -> rquickjs::Result<String> {
+        let joined = Path::new(base).parent().unwrap_or(Path::new(".")).join(name);
+        if let Ok(p) = joined.canonicalize() {
+            return Ok(p.to_string_lossy().into_owned());
         }
-
-        let script = std::fs::read_to_string(script_path)
-            .with_context(|| format!("Failed to read JS: {}", script_path.display()))?;
-
-        let source = if script_path.extension().is_some_and(|e| e == "ts") {
-            let filename = script_path
-                .file_name()
-                .unwrap_or_default()
-                .to_string_lossy()
-                .to_string();
-            match strip_typescript(&script, &filename) {
-                Ok(js) => js,
-                Err(e) => {
-                    let reason = format!("{}: {}", script_path.display(), e);
-                    self.modules.insert(canonicalized_path, Err(reason));
-                    return Ok(false);
-                }
-            }
-        } else {
-            script
-        };
-
-        let mut dependencies = Vec::new();
-        let mut result = Vec::new();
-
-        for (line_no, line) in source.lines().enumerate() {
-            let trimmed = line.trim();
-
-            if trimmed.starts_with("import ") || trimmed.starts_with("import{") {
-                if let Some((_, from_part)) = trimmed.split_once(" from ") {
-                    let module_path = from_part
-                        .trim()
-                        .trim_end_matches(';')
-                        .trim_matches(|c: char| c.is_whitespace() || c == '\'' || c == '"');
-                    let joined = script_path
-                        .parent()
-                        .unwrap_or(Path::new("."))
-                        .join(module_path);
-                    let loc = format!("{}:{}", script_path.display(), line_no + 1);
-                    match joined.canonicalize() {
-                        Ok(resolved_path) => match self.load(&resolved_path)? {
-                            true => dependencies.push(resolved_path),
-                            false => {
-                                let dep_reason = self
-                                    .modules
-                                    .get(&resolved_path)
-                                    .and_then(|r| r.as_ref().err())
-                                    .cloned()
-                                    .unwrap_or_else(|| resolved_path.display().to_string());
-                                let reason = format!("{}: {}", loc, dep_reason);
-                                self.modules.insert(canonicalized_path, Err(reason));
-                                return Ok(false);
-                            }
-                        },
-                        Err(_) => {
-                            let reason = format!("{}: cannot resolve '{}'", loc, module_path);
-                            self.modules.insert(canonicalized_path, Err(reason));
-                            return Ok(false);
-                        }
-                    }
-                }
-                // No 'from' clause (side-effect import) → skip line
-                continue;
-            }
-
-            if trimmed.starts_with("export {") {
-                continue;
-            }
-
-            if let Some(rest) = trimmed.strip_prefix("export default ") {
-                result.push(rest.to_string());
-                continue;
-            }
-
-            if let Some(rest) = trimmed.strip_prefix("export async function ") {
-                if let Some(paren) = rest.find('(') {
-                    let name = rest[..paren].trim();
-                    result.push(format!("var {} = async function {}", name, rest));
-                } else {
-                    result.push(rest.to_string());
-                }
-                continue;
-            }
-
-            if let Some(rest) = trimmed.strip_prefix("export function ") {
-                if let Some(paren) = rest.find('(') {
-                    let name = rest[..paren].trim();
-                    result.push(format!("var {} = function {}", name, rest));
-                } else {
-                    result.push(rest.to_string());
-                }
-                continue;
-            }
-
-            if let Some(rest) = trimmed.strip_prefix("export class ") {
-                let name_end = rest.find([' ', '{']).unwrap_or(rest.len());
-                let name = &rest[..name_end];
-                let rest_of_line = &rest[name_end..];
-                result.push(format!("var {} = class {}{}", name, name, rest_of_line));
-                continue;
-            }
-
-            if let Some(rest) = trimmed.strip_prefix("export const ") {
-                result.push(format!("var {}", rest));
-                continue;
-            }
-
-            if let Some(rest) = trimmed.strip_prefix("export let ") {
-                result.push(format!("var {}", rest));
-                continue;
-            }
-
-            if let Some(rest) = trimmed.strip_prefix("export var ") {
-                result.push(format!("var {}", rest));
-                continue;
-            }
-
-            // Other export forms (re-exports, etc.) — keep the non-export part
-            if let Some(rest) = trimmed.strip_prefix("export ") {
-                result.push(rest.to_string());
-                continue;
-            }
-
-            result.push(line.to_string());
-        }
-
-        self.modules.insert(
-            canonicalized_path,
-            Ok(LoadedModule {
-                script: result.join("\n"),
-                deps: dependencies,
-            }),
-        );
-
-        Ok(true)
-    }
-
-    /// Like [`load`] but treats unresolvable imports as side-effect imports (skip them)
-    /// instead of marking the module N/A. Use for files whose imports are injected
-    /// synthetically at eval time (e.g. `defineConfig` for config files).
-    ///
-    /// Always succeeds unless the file cannot be read or TypeScript stripping fails.
-    pub fn load_lenient(&mut self, script_path: &Path) -> Result<()> {
-        let canonicalized_path = script_path
-            .canonicalize()
-            .context("Failed to canonicalize script path")?;
-
-        if matches!(self.modules.get(&canonicalized_path), Some(Ok(_))) {
-            return Ok(());
-        }
-
-        let script = std::fs::read_to_string(script_path)
-            .with_context(|| format!("Failed to read: {}", script_path.display()))?;
-
-        let source = if script_path.extension().is_some_and(|e| e == "ts") {
-            let filename = script_path
-                .file_name()
-                .unwrap_or_default()
-                .to_string_lossy()
-                .to_string();
-            strip_typescript(&script, &filename)
-                .with_context(|| format!("Failed to strip TypeScript: {}", script_path.display()))?
-        } else {
-            script
-        };
-
-        let mut dependencies = Vec::new();
-        let mut result = Vec::new();
-
-        for line in source.lines() {
-            let trimmed = line.trim();
-
-            if trimmed.starts_with("import ") || trimmed.starts_with("import{") {
-                if let Some((_, from_part)) = trimmed.split_once(" from ") {
-                    let module_path = from_part
-                        .trim()
-                        .trim_end_matches(';')
-                        .trim_matches(|c: char| c.is_whitespace() || c == '\'' || c == '"');
-                    let joined = script_path
-                        .parent()
-                        .unwrap_or(Path::new("."))
-                        .join(module_path);
-                    if let Ok(resolved_path) = joined.canonicalize() {
-                        if self.load(&resolved_path)? {
-                            dependencies.push(resolved_path);
-                        }
-                        // Ok(false) → dep is N/A → skip silently
-                    }
-                    // Err → unresolvable → skip silently
-                }
-                continue;
-            }
-
-            if trimmed.starts_with("export {") {
-                continue;
-            }
-            if let Some(rest) = trimmed.strip_prefix("export default ") {
-                result.push(rest.to_string());
-                continue;
-            }
-            if let Some(rest) = trimmed.strip_prefix("export async function ") {
-                if let Some(paren) = rest.find('(') {
-                    result.push(format!(
-                        "var {} = async function {}",
-                        rest[..paren].trim(),
-                        rest
-                    ));
-                } else {
-                    result.push(rest.to_string());
-                }
-                continue;
-            }
-            if let Some(rest) = trimmed.strip_prefix("export function ") {
-                if let Some(paren) = rest.find('(') {
-                    result.push(format!("var {} = function {}", rest[..paren].trim(), rest));
-                } else {
-                    result.push(rest.to_string());
-                }
-                continue;
-            }
-            if let Some(rest) = trimmed.strip_prefix("export class ") {
-                let name_end = rest.find([' ', '{']).unwrap_or(rest.len());
-                let name = &rest[..name_end];
-                result.push(format!(
-                    "var {} = class {}{}",
-                    name,
-                    name,
-                    &rest[name_end..]
-                ));
-                continue;
-            }
-            if let Some(rest) = trimmed.strip_prefix("export const ") {
-                result.push(format!("var {}", rest));
-                continue;
-            }
-            if let Some(rest) = trimmed.strip_prefix("export let ") {
-                result.push(format!("var {}", rest));
-                continue;
-            }
-            if let Some(rest) = trimmed.strip_prefix("export var ") {
-                result.push(format!("var {}", rest));
-                continue;
-            }
-            if let Some(rest) = trimmed.strip_prefix("export ") {
-                result.push(rest.to_string());
-                continue;
-            }
-
-            result.push(line.to_string());
-        }
-
-        self.modules.insert(
-            canonicalized_path,
-            Ok(LoadedModule {
-                script: result.join("\n"),
-                deps: dependencies,
-            }),
-        );
-        Ok(())
-    }
-
-    pub fn get_preprocessed_script(&self, path: &Path) -> Option<&str> {
-        let canonical = path.canonicalize().ok()?;
-        self.modules
-            .get(&canonical)?
-            .as_ref()
-            .ok()
-            .map(|m| m.script.as_str())
-    }
-
-    fn na_reason(&self, path: &Path) -> &str {
-        path.canonicalize()
-            .ok()
-            .and_then(|p| self.modules.get(&p))
-            .and_then(|r| r.as_ref().err())
-            .map(String::as_str)
-            .unwrap_or("unresolvable dependency")
-    }
-
-    fn collect_ordered(
-        &self,
-        canonical: &PathBuf,
-        visited: &mut HashSet<PathBuf>,
-        order: &mut Vec<PathBuf>,
-    ) {
-        if visited.contains(canonical) {
-            return;
-        }
-        visited.insert(canonical.clone());
-        if let Some(Ok(module)) = self.modules.get(canonical) {
-            for dep in &module.deps {
-                self.collect_ordered(dep, visited, order);
+        // .js → .ts fallback: TypeScript ESM convention writes imports as .js.
+        if joined.extension().is_some_and(|e| e == "js") {
+            if let Ok(p) = joined.with_extension("ts").canonicalize() {
+                return Ok(p.to_string_lossy().into_owned());
             }
         }
-        order.push(canonical.clone());
-    }
-
-    /// Evaluate this module and its transitive dependencies in the given QuickJS context.
-    ///
-    /// Dependencies are eval'd before the module that imports them, so each module's
-    /// exported names (converted to `var`) are available as globals for subsequent evals.
-    ///
-    /// The caller is responsible for pre-configuring `ctx` before this call:
-    ///   - Register native Rust callbacks (e.g. `__gha_build`)
-    ///   - Eval any JS preamble (e.g. config values, helper functions)
-    pub fn execute_module(&self, path: &Path, ctx: &rquickjs::Ctx<'_>) -> Result<()> {
-        let canonical = path
-            .canonicalize()
-            .context("Failed to canonicalize path for execute_module")?;
-
-        match self.modules.get(&canonical) {
-            Some(Ok(_)) => {}
-            Some(Err(reason)) => {
-                return Err(anyhow::anyhow!(
-                    "Module {} is not available for QuickJS: {}",
-                    path.display(),
-                    reason
-                ))
-            }
-            None => return Err(anyhow::anyhow!("Module {} was not loaded", path.display())),
+        // Stub out generated/index.js when it doesn't exist yet (fresh project).
+        if joined.ends_with("generated/index.js") {
+            return Ok("__gaji_generated_stub__".to_string());
         }
-
-        let mut visited = HashSet::new();
-        let mut order = Vec::new();
-        self.collect_ordered(&canonical, &mut visited, &mut order);
-
-        for module_path in &order {
-            if let Some(Ok(module)) = self.modules.get(module_path) {
-                ctx.eval::<(), _>(module.script.as_bytes()).map_err(|e| {
-                    anyhow::anyhow!("QuickJS eval error in {}: {}", module_path.display(), e)
-                })?;
-            }
-        }
-
-        Ok(())
+        Err(rquickjs::Error::new_resolving(base, name))
     }
 }
 
-/// Execute a workflow TypeScript file in QuickJS via module resolution.
-///
-/// Loads the workflow file and its transitive dependencies (including the runtime).
-/// If the workflow or any dependency is QuickJS N/A, returns Err so the caller
-/// can fall back to a Node.js-based executor.
-///
-/// The caller provides a shared `resolver` so common modules (e.g. generated/index.js)
-/// are processed only once across multiple workflow builds in a single run.
+impl Loader for ModuleResolver {
+    fn load<'js>(
+        &mut self,
+        ctx: &rquickjs::Ctx<'js>,
+        name: &str,
+    ) -> rquickjs::Result<Module<'js>> {
+        if name == "__gaji_generated_stub__" {
+            return Module::declare(
+                ctx.clone(),
+                name,
+                "export const defineConfig = function(c) { return c; };",
+            );
+        }
+
+        let path = PathBuf::from(name);
+
+        let source = {
+            let mut cache = self.cache.lock().unwrap();
+            if let Some(cached) = cache.get(&path) {
+                cached.clone()
+            } else {
+                let raw = std::fs::read_to_string(&path)
+                    .map_err(|e| rquickjs::Error::new_loading_message(name, e.to_string()))?;
+                let stripped = if path.extension().is_some_and(|e| e == "ts") {
+                    let filename = path
+                        .file_name()
+                        .unwrap_or_default()
+                        .to_string_lossy()
+                        .to_string();
+                    strip_typescript(&raw, &filename)
+                        .map_err(|e| rquickjs::Error::new_loading_message(name, e.to_string()))?
+                } else {
+                    raw
+                };
+                cache.insert(path.clone(), stripped.clone());
+                stripped
+            }
+        };
+
+        Module::declare(ctx.clone(), name, source.as_str())
+    }
+}
+
+
+/// The `resolver` holds a shared source cache so TypeScript stripping of common
+/// imported modules is done only once across multiple workflow builds in a single
+/// run. Any unresolvable import causes an error, which the caller should treat
+/// as a signal to fall back to Node.js.
 pub fn execute_workflow(
     resolver: &mut ModuleResolver,
     workflow_path: &Path,
 ) -> Result<Vec<BuildOutput>> {
-    if !resolver.load(workflow_path)? {
-        let reason = resolver.na_reason(workflow_path);
-        return Err(anyhow::anyhow!(
-            "Workflow {} cannot be processed by QuickJS: {}",
-            workflow_path.display(),
-            reason
-        ));
-    }
+    let canonical = workflow_path
+        .canonicalize()
+        .context("Failed to canonicalize workflow path")?;
+
+    let raw = std::fs::read_to_string(&canonical)
+        .with_context(|| format!("Failed to read workflow: {}", canonical.display()))?;
+    let source = if canonical.extension().is_some_and(|e| e == "ts") {
+        let filename = canonical
+            .file_name()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .to_string();
+        strip_typescript(&raw, &filename)
+            .with_context(|| format!("Failed to strip TypeScript: {}", canonical.display()))?
+    } else {
+        raw
+    };
 
     let outputs: Rc<RefCell<Vec<BuildOutput>>> = Rc::new(RefCell::new(Vec::new()));
 
     {
+        let loader = resolver.clone();
         let rt = JsRuntime::new().context("Failed to create QuickJS runtime")?;
+        rt.set_loader(loader.clone(), loader);
         let ctx = JsContext::full(&rt).context("Failed to create QuickJS context")?;
 
         ctx.with(|ctx| {
@@ -462,7 +172,13 @@ pub fn execute_workflow(
                 .set("__gha_build", build_fn)
                 .map_err(|e| anyhow::anyhow!("Failed to set __gha_build: {}", e))?;
 
-            resolver.execute_module(workflow_path, &ctx)
+            let entry_name = canonical.to_string_lossy().into_owned();
+            Module::evaluate(ctx.clone(), entry_name, source.as_str())
+                .map_err(|e| anyhow::anyhow!("QuickJS workflow module error: {}", e))?
+                .finish::<()>()
+                .map_err(|e| anyhow::anyhow!("QuickJS workflow evaluation error: {}", e))?;
+
+            Ok::<_, anyhow::Error>(())
         })?;
     }
 
@@ -473,8 +189,56 @@ pub fn execute_workflow(
     Ok(result)
 }
 
-/// Register __gha_build host function and evaluate JavaScript with QuickJS.
-/// Uses Rc/RefCell pattern to capture build outputs from JS callbacks.
+/// The entry script sets `globalThis.defineConfig` before dynamically importing
+/// the config, so configs that call `defineConfig` without an explicit import
+/// work on fresh projects. Configs that do import from `./generated/index.js`
+/// get an identity stub when that file is absent.
+pub fn execute_config(resolver: &mut ModuleResolver, config_path: &Path) -> Result<String> {
+    let canonical = config_path
+        .canonicalize()
+        .context("Failed to canonicalize config path")?;
+
+    // Dynamic import runs after the globalThis assignment, so defineConfig is
+    // available as a global when the config module body evaluates.
+    let entry = format!(
+        "globalThis.defineConfig = function(c) {{ return c; }};\nconst mod = await import({:?});\n__gha_set_config(JSON.stringify(mod.default));",
+        canonical.to_string_lossy().into_owned()
+    );
+
+    let json: Rc<RefCell<Option<String>>> = Rc::new(RefCell::new(None));
+
+    {
+        let loader = resolver.clone();
+        let rt = JsRuntime::new().context("Failed to create QuickJS runtime")?;
+        rt.set_loader(loader.clone(), loader);
+        let ctx = JsContext::full(&rt).context("Failed to create QuickJS context")?;
+
+        ctx.with(|ctx| {
+            let json_clone = json.clone();
+            ctx.globals()
+                .set(
+                    "__gha_set_config",
+                    Func::from(move |s: String| {
+                        *json_clone.borrow_mut() = Some(s);
+                    }),
+                )
+                .map_err(|e| anyhow::anyhow!("Failed to set __gha_set_config: {}", e))?;
+
+            Module::evaluate(ctx.clone(), "__gaji_config_entry__", entry.as_str())
+                .map_err(|e| anyhow::anyhow!("QuickJS config module error: {}", e))?
+                .finish::<()>()
+                .map_err(|e| anyhow::anyhow!("QuickJS config evaluation error: {}", e))?;
+
+            Ok::<_, anyhow::Error>(())
+        })?;
+    }
+
+    Rc::try_unwrap(json)
+        .map_err(|_| anyhow::anyhow!("Failed to unwrap Rc - references still held"))?
+        .into_inner()
+        .context("Config did not call __gha_set_config")
+}
+
 pub fn execute_js(code: &str) -> Result<Vec<BuildOutput>> {
     let outputs: Rc<RefCell<Vec<BuildOutput>>> = Rc::new(RefCell::new(Vec::new()));
 
@@ -487,7 +251,6 @@ pub fn execute_js(code: &str) -> Result<Vec<BuildOutput>> {
         ctx.with(|ctx| {
             let outputs_clone = outputs.clone();
 
-            // Register __gha_build(id, json, type) host function
             let build_fn = Func::from(
                 move |id: String, json: String, output_type: rquickjs::function::Opt<String>| {
                     outputs_clone.borrow_mut().push(BuildOutput {
@@ -502,17 +265,16 @@ pub fn execute_js(code: &str) -> Result<Vec<BuildOutput>> {
                 .set("__gha_build", build_fn)
                 .map_err(|e| anyhow::anyhow!("Failed to set __gha_build: {}", e))?;
 
-            // Evaluate the bundled JavaScript
             ctx.eval::<(), _>(code_owned.as_bytes())
                 .map_err(|e| anyhow::anyhow!("QuickJS evaluation error: {}", e))?;
 
             Ok::<_, anyhow::Error>(())
         })?;
 
-        // ctx and rt are dropped here, releasing the Rc clone held by the Func
+        // ctx and rt drop here, releasing the Rc clone held by Func
     }
 
-    // Extract the outputs - Rc::try_unwrap succeeds because ctx/rt are dropped
+    // Rc::try_unwrap succeeds because ctx/rt are now dropped
     let result = Rc::try_unwrap(outputs)
         .map_err(|_| anyhow::anyhow!("Failed to unwrap Rc - references still held"))?
         .into_inner();
@@ -524,8 +286,6 @@ pub fn execute_js(code: &str) -> Result<Vec<BuildOutput>> {
 mod tests {
     use super::*;
 
-    /// Strip export/import for tests that use execute_js with a single bundled string.
-    /// In single-eval mode class/function/const all work without var conversion.
     fn strip_for_eval(source: &str) -> String {
         let mut result = Vec::new();
         for line in source.lines() {
@@ -556,34 +316,33 @@ mod tests {
     }
 
     #[test]
-    fn test_module_export_as_global() {
+    fn test_module_exports_via_import() {
         let dir = tempfile::tempdir().unwrap();
-        let mod_path = dir.path().join("test.js");
+        let mod_path = dir.path().join("mod.js");
+        let main_path = dir.path().join("main.js");
+
         std::fs::write(
             &mod_path,
             "export const x = 42;\nexport function greet() { return \"hello\"; }\n",
         )
         .unwrap();
+        std::fs::write(
+            &main_path,
+            "import { x, greet } from './mod.js';\n\
+             __gha_build('test', JSON.stringify({x, greeting: greet()}), 'workflow');\n",
+        )
+        .unwrap();
 
         let mut resolver = ModuleResolver::default();
-        assert!(resolver.load(&mod_path).unwrap());
-
-        let rt = JsRuntime::new().unwrap();
-        let ctx = JsContext::full(&rt).unwrap();
-        ctx.with(|ctx| {
-            resolver.execute_module(&mod_path, &ctx).unwrap();
-            let x: i32 = ctx.globals().get("x").unwrap();
-            assert_eq!(x, 42);
-            let greeting: String = ctx
-                .eval("greet()")
-                .map_err(|e| anyhow::anyhow!("{}", e))
-                .unwrap();
-            assert_eq!(greeting, "hello");
-        });
+        let outputs = execute_workflow(&mut resolver, &main_path).unwrap();
+        assert_eq!(outputs.len(), 1);
+        let json: serde_json::Value = serde_json::from_str(&outputs[0].json).unwrap();
+        assert_eq!(json["x"], 42);
+        assert_eq!(json["greeting"], "hello");
     }
 
     #[test]
-    fn test_module_na_on_missing_dep() {
+    fn test_module_error_on_missing_dep() {
         let dir = tempfile::tempdir().unwrap();
         let mod_path = dir.path().join("test.js");
         std::fs::write(
@@ -593,7 +352,7 @@ mod tests {
         .unwrap();
 
         let mut resolver = ModuleResolver::default();
-        assert!(!resolver.load(&mod_path).unwrap());
+        assert!(execute_workflow(&mut resolver, &mod_path).is_err());
     }
 
     #[test]
@@ -605,20 +364,16 @@ mod tests {
         std::fs::write(&dep_path, "export const BASE = 10;\n").unwrap();
         std::fs::write(
             &main_path,
-            "import { BASE } from \"./dep.js\";\nexport const VALUE = BASE + 5;\n",
+            "import { BASE } from './dep.js';\n\
+             __gha_build('test', JSON.stringify({value: BASE + 5}), 'workflow');\n",
         )
         .unwrap();
 
         let mut resolver = ModuleResolver::default();
-        assert!(resolver.load(&main_path).unwrap());
-
-        let rt = JsRuntime::new().unwrap();
-        let ctx = JsContext::full(&rt).unwrap();
-        ctx.with(|ctx| {
-            resolver.execute_module(&main_path, &ctx).unwrap();
-            let value: i32 = ctx.globals().get("VALUE").unwrap();
-            assert_eq!(value, 15);
-        });
+        let outputs = execute_workflow(&mut resolver, &main_path).unwrap();
+        assert_eq!(outputs.len(), 1);
+        let json: serde_json::Value = serde_json::from_str(&outputs[0].json).unwrap();
+        assert_eq!(json["value"], 15);
     }
 
     #[test]
@@ -648,7 +403,6 @@ mod tests {
         assert_eq!(outputs[2].output_type, "action");
     }
 
-    /// End-to-end test: runtime JS + Job/Workflow classes → QuickJS → JSON output
     #[test]
     fn test_job_workflow_pipeline() {
         use crate::generator::templates::JOB_WORKFLOW_RUNTIME_TEMPLATE;
@@ -704,7 +458,6 @@ new Workflow({
         assert_eq!(steps[1]["run"], "npm test");
     }
 
-    /// Test Action (formerly CompositeAction) through QuickJS
     #[test]
     fn test_composite_action_pipeline() {
         use crate::generator::templates::JOB_WORKFLOW_RUNTIME_TEMPLATE;
@@ -739,7 +492,6 @@ new Action({
         assert_eq!(json["runs"]["steps"][0]["run"], "echo hello");
     }
 
-    /// Test full TS→JS strip + QuickJS execution
     #[test]
     fn test_strip_then_execute() {
         use crate::generator::templates::JOB_WORKFLOW_RUNTIME_TEMPLATE;
@@ -749,7 +501,6 @@ new Action({
             JOB_WORKFLOW_RUNTIME_TEMPLATE
         );
 
-        // TypeScript source with type annotations
         let ts_source = r#"
 const wf: Workflow = new Workflow({
     name: "Typed",
